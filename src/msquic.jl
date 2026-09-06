@@ -155,6 +155,19 @@ end
     CANCEL_ON_LOSS = 10
 end
 
+# QUIC_DATAGRAM_SEND_STATE. A datagram's context comes back once per state change; only the
+# terminal ones mean msquic is done with the buffer.
+@enum DatagramSendState::UInt32 begin
+    DGRAM_UNKNOWN = 0
+    DGRAM_SENT = 1
+    DGRAM_LOST_SUSPECT = 2
+    DGRAM_LOST_DISCARDED = 3
+    DGRAM_ACKNOWLEDGED = 4
+    DGRAM_ACKNOWLEDGED_SPURIOUS = 5
+    DGRAM_CANCELED = 6
+end
+dgram_terminal(st::UInt32) = st in (UInt32(3), UInt32(4), UInt32(5), UInt32(6))
+
 # Flags
 const CRED_FLAG_CLIENT = UInt32(0x1)
 const CRED_FLAG_NO_CERTIFICATE_VALIDATION = UInt32(0x4)

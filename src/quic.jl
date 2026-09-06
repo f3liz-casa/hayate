@@ -92,7 +92,10 @@ function on_connection(::HQUIC, ctx::Ptr{Cvoid}, ev::Ptr{Cvoid})::Status
         elseif t == MsQuic.DATAGRAM_STATE_CHANGED
             conn.datagram_max = Int(payload(MsQuic.EvDatagramStateChanged, ev).MaxSendLength)
         elseif t == MsQuic.DATAGRAM_SEND_STATE_CHANGED
-            unroot!(payload(MsQuic.EvDatagramSendState, ev).ClientContext)
+            # SENT is followed by ACKNOWLEDGED or LOST for the same context. Unroot only once,
+            # at a terminal state; the pointer must still be valid until then.
+            e = payload(MsQuic.EvDatagramSendState, ev)
+            MsQuic.dgram_terminal(e.State) && unroot!(e.ClientContext)
         elseif t == MsQuic.SHUTDOWN_INITIATED_BY_TRANSPORT
             e = payload(MsQuic.EvShutdownByTransport, ev)
             put!(conn.events, Shutdown(:transport, e.Status, e.ErrorCode))
