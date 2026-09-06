@@ -50,7 +50,11 @@ QUICTLS=${WORKSPACE}/quictls
 cd openssl
 perl ./Configure ${ssl_target} --prefix=${QUICTLS} --libdir=lib ${ssl_flags}
 make -j${nproc} build_libs
-make install_dev
+# Not `make install_dev`: OpenSSL's darwin targets run `ranlib -c`, which llvm-ranlib rejects.
+# The two archives and the headers are all msquic needs.
+mkdir -p ${QUICTLS}/lib ${QUICTLS}/include
+cp libssl.a libcrypto.a ${QUICTLS}/lib/
+cp -r include/openssl ${QUICTLS}/include/
 cd ..
 
 # --- 2. msquic, told that quictls is already there ---
