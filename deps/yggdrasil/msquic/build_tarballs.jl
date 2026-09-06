@@ -32,6 +32,10 @@ if [[ "${target}" == x86_64-apple-darwin* ]]; then
     popd
     export MACOSX_DEPLOYMENT_TARGET=10.14
 fi
+if [[ "${target}" == *-apple-* ]]; then
+    # msquic builds with -Werror; this clang flags a VLA-folded-to-constant in datapath_kqueue.c
+    export CFLAGS="${CFLAGS} -Wno-error=gnu-folding-constant"
+fi
 
 # --- 1. quictls, static, configured for the target by name ---
 case "${target}" in
