@@ -57,9 +57,12 @@ happens on msquic's threads. Julia adopts the foreign thread on entry, so this i
 ## What it needs
 
 - Julia 1.10 or newer. Run with `-t 2` or more; the session pump is a task.
-- `libmsquic`. By default Hayate looks for the one quicer built inside a karutte checkout
-  (`~/repos/karutte-wt-next/core/deps/quicer/c_build/msquic/bin/Release/libmsquic.dylib`).
-  Point `HAYATE_LIBMSQUIC` at another. An `msquic_jll` is the obvious next step.
+- `libmsquic`. Three ways, in order of preference:
+  1. `using msquic_jll` alongside Hayate. The jll is not in the General registry yet; the
+     Yggdrasil recipe is in [`deps/yggdrasil/msquic/`](deps/yggdrasil/msquic/), and a
+     hand-built stand-in with the same shape lives at `~/repos/msquic_jll` for now.
+  2. `HAYATE_LIBMSQUIC=/path/to/libmsquic.dylib`.
+  3. Nothing: Hayate looks for the one quicer built inside a karutte checkout.
 
 ## Tests
 

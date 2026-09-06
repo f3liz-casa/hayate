@@ -21,9 +21,12 @@ struct QuicError <: Exception
 end
 Base.showerror(io::IO, e::QuicError) = print(io, "msquic ", e.call, " failed: 0x", string(e.status, base = 16))
 
-# Where libmsquic lives. Until there is an msquic_jll, we borrow the one quicer builds.
+# Where libmsquic lives, in order of preference: msquic_jll if it is loaded (the
+# HayateMsQuicExt extension fills `LIB`), then HAYATE_LIBMSQUIC, then the one quicer builds
+# inside a karutte checkout.
+const LIB = Ref{Union{Nothing,String}}(nothing)
 const DEFAULT_LIB = expanduser("~/repos/karutte-wt-next/core/deps/quicer/c_build/msquic/bin/Release/libmsquic.dylib")
-libpath() = get(ENV, "HAYATE_LIBMSQUIC", DEFAULT_LIB)
+libpath() = something(LIB[], get(ENV, "HAYATE_LIBMSQUIC", nothing), DEFAULT_LIB)
 
 # --- C structs, laid out as in msquic.h ---
 

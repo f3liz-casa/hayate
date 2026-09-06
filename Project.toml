@@ -7,8 +7,15 @@ version = "0.1.0"
 Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 
+[weakdeps]
+msquic_jll = "3c1d9b8a-6f2e-4a7b-9c0d-5e1f2a3b4c5d"
+
+[extensions]
+HayateMsQuicExt = "msquic_jll"
+
 [compat]
 julia = "1.10"
+msquic_jll = "2.5"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
