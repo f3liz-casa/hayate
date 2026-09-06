@@ -8,7 +8,7 @@ module WebTransport
 using ..Quic, ..H3
 using ..Quic: take_within
 
-export Session, connect, openstream, senddatagram, datagrams, streams, abort, ConnectError
+export Session, connect, openstream, senddatagram, datagrams, streams, abort, RejectedError
 
 mutable struct Session
     conn::Quic.Connection
@@ -21,18 +21,19 @@ mutable struct Session
 end
 Base.show(io::IO, s::Session) = print(io, "WebTransport.Session(", s.url, ", id=", s.id, isopen(s) ? "" : ", closed", ")")
 
-struct ConnectError <: Exception
+"The server answered the CONNECT with something other than 200."
+struct RejectedError <: Exception
     url::String
     status::String
 end
-Base.showerror(io::IO, e::ConnectError) = print(io, "WebTransport CONNECT ", e.url, ": ", e.status)
+Base.showerror(io::IO, e::RejectedError) = print(io, "WebTransport CONNECT ", e.url, " rejected: ", e.status)
 
 """
     connect(url; verify = true, timeout = 5.0, settings...) -> Session
     connect(f, url; ...)
 
 `url` is `https://host:port/path`. `verify = false` accepts a self-signed certificate. Throws
-`ConnectError` if the server answers anything but 200. The `do` form closes the session
+`RejectedError` if the server answers anything but 200, `Quic.ConnectError` if QUIC fails. The `do` form closes the session
 when `f` returns.
 """
 function connect(url::AbstractString; verify = true, timeout = 5.0, kw...)
@@ -52,7 +53,7 @@ function connect(url::AbstractString; verify = true, timeout = 5.0, kw...)
         req = Quic.openstream(conn)
         write(req, H3.frame(H3.FRAME_HEADERS, H3.encode_connect(authority, path)))
         status = read_status(req, timeout)
-        status == "200" || throw(ConnectError(String(url), status))
+        status == "200" || throw(RejectedError(String(url), status))
 
         sess = Session(conn, req.id, req, Channel{Quic.Stream}(Inf), Channel{Vector{UInt8}}(Inf), String(url), Task(() -> nothing))
         sess.pump = Threads.@spawn pump(sess)

@@ -36,7 +36,8 @@ end                                          # the do form closes the session
 
 `abort(st, code)` resets a stream. Errors are exceptions: `MsQuic.QuicError` (a call failed,
 with its status), `Quic.StreamReset` (the peer reset us, with the code),
-`Quic.ConnectError` and `WebTransport.ConnectError` (with the status the server sent).
+`Quic.ConnectError` (the handshake failed, with why) and `WebTransport.RejectedError` (the
+server answered the CONNECT with a status other than 200).
 
 ## Layers
 
