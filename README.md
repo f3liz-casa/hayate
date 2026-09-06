@@ -8,32 +8,35 @@ WebTransport session to a server, sends and receives streams and datagrams, and 
 need a browser to do it.
 
 > **Status: it works, and it is young.** It talks to karutte-core end to end (CONNECT 200,
-> bidirectional echo, datagram echo, 200 KB round trips) on real QUIC. The API may still move.
+> bidirectional echo, datagram echo, 200 KB round trips) on real QUIC; 48 tests. The API may still move.
 > There is no `msquic_jll` yet, so it borrows the `libmsquic.dylib` that quicer builds.
 
 ## What it looks like
 
+A stream is an `IO`. Everything you already know how to do with one works.
+
 ```julia
 using Hayate: WebTransport
 
-s = WebTransport.connect("https://localhost:4433/asobi?name=koe"; verify = false)
+WebTransport.connect("https://localhost:4433/asobi?name=koe"; verify = false) do s
+    st = WebTransport.openstream(s)          # bidirectional; the header is written for you
+    print(st, "hello, "); write(st, "hayate")
+    closewrite(st)                           # FIN; we can still read
+    println(read(st, String))                # "hello, hayate", if the other end echoes
+    readline(st); eof(st)                    # all the usual IO verbs
 
-st = WebTransport.open_stream(s)            # bidirectional; header written for you
-write(st, "hello"; fin = true)
-println(String(read(st, Vector{UInt8})))    # "hello", if the other end echoes
+    WebTransport.senddatagram(s, "ping")
+    d = take!(WebTransport.datagrams(s))     # a Channel of payloads from the server
 
-WebTransport.send_datagram(s, "ping")
-d = take!(WebTransport.datagrams(s))        # a Channel of payloads from the server
-
-for incoming in WebTransport.incoming_streams(s)   # streams the server opened (server push)
-    bytes, fin = read(incoming)
-end
-
-close(s)
+    for incoming in WebTransport.streams(s)  # streams the server opened (server push)
+        println(read(incoming, String))
+    end
+end                                          # the do form closes the session
 ```
 
-Streams are `read`/`write`. `read(st)` returns `(bytes, fin)`; `read(st, Vector{UInt8})`
-collects until FIN. `close_write(st)` half-closes; `reset(st, code)` aborts.
+`abort(st, code)` resets a stream. Errors are exceptions: `MsQuic.QuicError` (a call failed,
+with its status), `Quic.StreamReset` (the peer reset us, with the code),
+`Quic.ConnectError` and `WebTransport.ConnectError` (with the status the server sent).
 
 ## Layers
 
@@ -41,8 +44,8 @@ The same split quicer uses, so the two ends rhyme:
 
 | Module | What it is |
 |---|---|
-| `Hayate.MsQuic` | The raw C API. Loads the library, fetches the function table, installs the two callbacks. Struct layouts as measured byte offsets (`test/off.c`). |
-| `Hayate.Quic` | `Connection` and `Stream`. Events from msquic's threads land in Channels; the API blocks on them. |
+| `Hayate.MsQuic` | The raw C API. Loads the library, fetches the function table, installs the two callbacks. C structs are Julia `struct`s with the same layout; a test checks every `fieldoffset` against numbers measured with clang (`test/off.c`). |
+| `Hayate.Quic` | `Connection` and `Stream <: IO`. Events from msquic's threads land in Channels; the IO methods block on them. |
 | `Hayate.H3` | Varints, frames, SETTINGS, the WebTransport stream header and datagram prefix, and a static-table-only QPACK that can say CONNECT and read a status. |
 | `Hayate.WebTransport` | `Session`: H3 handshake, Extended CONNECT, streams and datagrams routed by session id. |
 

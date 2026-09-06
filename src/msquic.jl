@@ -2,25 +2,171 @@
 The raw msquic API. Loads the shared library, fetches the function table, and installs the
 two callbacks (connection, stream) that msquic calls from its own worker threads.
 
-Struct layouts are written as byte offsets, measured on this platform with clang against
-msquic.h (see `test/off.c`). If msquic changes its structs this is where it breaks, loudly.
+C structs are declared as Julia `struct`s with the same layout, so fields are read by name.
+`test/runtests.jl` checks `sizeof` and `fieldoffset` against numbers measured with clang
+(`test/off.c`). If msquic changes a struct, that test is where it breaks, loudly.
 """
 module MsQuic
 
 using Libdl
-
-export API, api, Status, STATUS_SUCCESS, STATUS_PENDING, HQUIC
 
 const HQUIC = Ptr{Cvoid}
 const Status = UInt32
 const STATUS_SUCCESS = Status(0)
 const STATUS_PENDING = Status(0xFFFFFFFE)
 
+struct QuicError <: Exception
+    call::Symbol
+    status::Status
+end
+Base.showerror(io::IO, e::QuicError) = print(io, "msquic ", e.call, " failed: 0x", string(e.status, base = 16))
+
 # Where libmsquic lives. Until there is an msquic_jll, we borrow the one quicer builds.
 const DEFAULT_LIB = expanduser("~/repos/karutte-wt-next/core/deps/quicer/c_build/msquic/bin/Release/libmsquic.dylib")
 libpath() = get(ENV, "HAYATE_LIBMSQUIC", DEFAULT_LIB)
 
-# Function table, QUIC_API_TABLE, in declaration order (1-based).
+# --- C structs, laid out as in msquic.h ---
+
+struct Buffer                      # QUIC_BUFFER
+    Length::UInt32
+    Buffer::Ptr{UInt8}
+end
+
+struct RegistrationConfig          # QUIC_REGISTRATION_CONFIG
+    AppName::Cstring
+    ExecutionProfile::Int32
+end
+
+struct CredentialConfig            # QUIC_CREDENTIAL_CONFIG
+    Type::Int32
+    Flags::UInt32
+    Certificate::Ptr{Cvoid}
+    Principal::Cstring
+    Reserved::Ptr{Cvoid}
+    AsyncHandler::Ptr{Cvoid}
+    AllowedCipherSuites::UInt32
+    CaCertificateFile::Cstring
+end
+
+Base.@kwdef struct Settings        # QUIC_SETTINGS (144 bytes)
+    IsSetFlags::UInt64 = 0
+    MaxBytesPerKey::UInt64 = 0
+    HandshakeIdleTimeoutMs::UInt64 = 0
+    IdleTimeoutMs::UInt64 = 0
+    MtuDiscoverySearchCompleteTimeoutUs::UInt64 = 0
+    TlsClientMaxSendBuffer::UInt32 = 0
+    TlsServerMaxSendBuffer::UInt32 = 0
+    StreamRecvWindowDefault::UInt32 = 0
+    StreamRecvBufferDefault::UInt32 = 0
+    ConnFlowControlWindow::UInt32 = 0
+    MaxWorkerQueueDelayUs::UInt32 = 0
+    MaxStatelessOperations::UInt32 = 0
+    InitialWindowPackets::UInt32 = 0
+    SendIdleTimeoutMs::UInt32 = 0
+    InitialRttMs::UInt32 = 0
+    MaxAckDelayMs::UInt32 = 0
+    DisconnectTimeoutMs::UInt32 = 0
+    KeepAliveIntervalMs::UInt32 = 0
+    CongestionControlAlgorithm::UInt16 = 0
+    PeerBidiStreamCount::UInt16 = 0
+    PeerUnidiStreamCount::UInt16 = 0
+    MaxBindingStatelessOperations::UInt16 = 0
+    StatelessOperationExpirationMs::UInt16 = 0
+    MinimumMtu::UInt16 = 0
+    MaximumMtu::UInt16 = 0
+    Bits::UInt8 = 0                # SendBuffering:1 Pacing:1 Migration:1 DatagramReceive:1 ServerResumptionLevel:2 GreaseQuicBit:1 Ecn:1
+    MaxOperationsPerDrain::UInt8 = 0
+    MtuDiscoveryMissingProbeCount::UInt8 = 0
+    DestCidUpdateIdleTimeoutMs::UInt32 = 0
+    Flags::UInt64 = 0
+    StreamRecvWindowBidiLocalDefault::UInt32 = 0
+    StreamRecvWindowBidiRemoteDefault::UInt32 = 0
+    StreamRecvWindowUnidiDefault::UInt32 = 0
+end
+
+# IsSetFlags bit positions (order of the IsSet bitfield in msquic.h)
+const ISSET_IDLE_TIMEOUT = UInt64(1) << 2
+const ISSET_KEEP_ALIVE = UInt64(1) << 16
+const ISSET_PEER_BIDI = UInt64(1) << 18
+const ISSET_PEER_UNIDI = UInt64(1) << 19
+const ISSET_DATAGRAM_RECEIVE = UInt64(1) << 27
+const BIT_DATAGRAM_RECEIVE = UInt8(1) << 3
+
+"""
+Settings for a client. Fields left unset keep msquic's defaults. The peer stream counts
+matter: the server opens three unidirectional streams (control, QPACK encoder, decoder)
+before anything else can happen.
+"""
+function settings(; peer_bidi = 256, peer_unidi = 256, datagram_receive = true,
+                    idle_timeout_ms = 30_000, keep_alive_ms = 0)
+    isset = ISSET_IDLE_TIMEOUT | ISSET_PEER_BIDI | ISSET_PEER_UNIDI | ISSET_DATAGRAM_RECEIVE |
+            (keep_alive_ms > 0 ? ISSET_KEEP_ALIVE : 0)
+    Settings(; IsSetFlags = isset, IdleTimeoutMs = idle_timeout_ms, KeepAliveIntervalMs = keep_alive_ms,
+               PeerBidiStreamCount = peer_bidi, PeerUnidiStreamCount = peer_unidi,
+               Bits = datagram_receive ? BIT_DATAGRAM_RECEIVE : 0x00)
+end
+
+# Event payloads. Each sits at offset 8 of the event struct, after the 4-byte type and padding.
+struct EvConnected;           SessionResumed::UInt8; NegotiatedAlpnLength::UInt8; NegotiatedAlpn::Ptr{UInt8}; end
+struct EvShutdownByTransport; Status::Status; ErrorCode::UInt64; end
+struct EvShutdownByPeer;      ErrorCode::UInt64; end
+struct EvPeerStreamStarted;   Stream::HQUIC; Flags::UInt32; end
+struct EvDatagramStateChanged; SendEnabled::UInt8; MaxSendLength::UInt16; end
+struct EvDatagramReceived;    Buffer::Ptr{Buffer}; Flags::UInt32; end
+struct EvDatagramSendState;   ClientContext::Ptr{Cvoid}; State::UInt32; end
+struct EvStartComplete;       Status::Status; ID::UInt64; PeerAccepted::UInt8; end
+struct EvReceive;             AbsoluteOffset::UInt64; TotalBufferLength::UInt64; Buffers::Ptr{Buffer}; BufferCount::UInt32; Flags::UInt32; end
+struct EvSendComplete;        Canceled::UInt8; ClientContext::Ptr{Cvoid}; end
+struct EvPeerSendAborted;     ErrorCode::UInt64; end
+
+event_type(ev::Ptr{Cvoid}) = unsafe_load(Ptr{UInt32}(ev))
+payload(::Type{T}, ev::Ptr{Cvoid}) where {T} = unsafe_load(Ptr{T}(ev + 8))
+
+@enum ConnectionEvent::UInt32 begin
+    CONNECTED = 0
+    SHUTDOWN_INITIATED_BY_TRANSPORT = 1
+    SHUTDOWN_INITIATED_BY_PEER = 2
+    SHUTDOWN_COMPLETE = 3
+    LOCAL_ADDRESS_CHANGED = 4
+    PEER_ADDRESS_CHANGED = 5
+    PEER_STREAM_STARTED = 6
+    STREAMS_AVAILABLE = 7
+    PEER_NEEDS_STREAMS = 8
+    IDEAL_PROCESSOR_CHANGED = 9
+    DATAGRAM_STATE_CHANGED = 10
+    DATAGRAM_RECEIVED = 11
+    DATAGRAM_SEND_STATE_CHANGED = 12
+    RESUMED = 13
+    RESUMPTION_TICKET_RECEIVED = 14
+    PEER_CERTIFICATE_RECEIVED = 15
+end
+
+@enum StreamEvent::UInt32 begin
+    START_COMPLETE = 0
+    RECEIVE = 1
+    SEND_COMPLETE = 2
+    PEER_SEND_SHUTDOWN = 3
+    PEER_SEND_ABORTED = 4
+    PEER_RECEIVE_ABORTED = 5
+    SEND_SHUTDOWN_COMPLETE = 6
+    STREAM_SHUTDOWN_COMPLETE = 7
+    IDEAL_SEND_BUFFER_SIZE = 8
+    PEER_ACCEPTED = 9
+    CANCEL_ON_LOSS = 10
+end
+
+# Flags
+const CRED_FLAG_CLIENT = UInt32(0x1)
+const CRED_FLAG_NO_CERTIFICATE_VALIDATION = UInt32(0x4)
+const STREAM_OPEN_UNIDIRECTIONAL = UInt32(0x1)
+const SEND_FLAG_FIN = UInt32(0x4)
+const STREAM_SHUTDOWN_GRACEFUL = UInt32(0x1)
+const STREAM_SHUTDOWN_ABORT = UInt32(0x6)
+const RECEIVE_FLAG_FIN = UInt32(0x2)
+
+# --- The library and its function table ---
+
+# QUIC_API_TABLE, in declaration order.
 const TABLE = (
     SetContext = 1, GetContext = 2, SetCallbackHandler = 3, SetParam = 4, GetParam = 5,
     RegistrationOpen = 6, RegistrationClose = 7, RegistrationShutdown = 8,
@@ -39,214 +185,130 @@ mutable struct Api
 end
 
 const API = Ref{Union{Nothing,Api}}(nothing)
+const API_LOCK = ReentrantLock()
 
 "Open msquic once (version 2 table) and one registration for the whole process."
 function api()
-    a = API[]
-    a === nothing || return a
-    lib = dlopen(libpath())
-    open = dlsym(lib, :MsQuicOpenVersion)
-    tbl = Ref{Ptr{Ptr{Cvoid}}}(C_NULL)
-    st = ccall(open, Status, (UInt32, Ref{Ptr{Ptr{Cvoid}}}), 2, tbl)
-    st == STATUS_SUCCESS || error("MsQuicOpenVersion: 0x$(string(st, base=16))")
-    a = Api(lib, tbl[], C_NULL)
-    # QUIC_REGISTRATION_CONFIG { const char* AppName; int ExecutionProfile; } (16 bytes)
-    cfg = zeros(UInt8, 16)
-    name = "hayate"
-    GC.@preserve name cfg begin
-        unsafe_store!(Ptr{Ptr{UInt8}}(pointer(cfg)), pointer(name))
+    lock(API_LOCK) do
+        a = API[]
+        a === nothing || return a
+        lib = dlopen(libpath())
+        tbl = Ref{Ptr{Ptr{Cvoid}}}(C_NULL)
+        st = ccall(dlsym(lib, :MsQuicOpenVersion), Status, (UInt32, Ref{Ptr{Ptr{Cvoid}}}), 2, tbl)
+        st == STATUS_SUCCESS || throw(QuicError(:MsQuicOpenVersion, st))
+        a = Api(lib, tbl[], C_NULL)
+        name = "hayate"
         reg = Ref{HQUIC}(C_NULL)
-        st = ccall(fn(a, :RegistrationOpen), Status, (Ptr{UInt8}, Ref{HQUIC}), cfg, reg)
-        st == STATUS_SUCCESS || error("RegistrationOpen: 0x$(string(st, base=16))")
+        GC.@preserve name begin
+            cfg = Ref(RegistrationConfig(pointer(name), 0))
+            check(:RegistrationOpen, ccall(fn(a, :RegistrationOpen), Status, (Ref{RegistrationConfig}, Ref{HQUIC}), cfg, reg))
+        end
         a.registration = reg[]
+        API[] = a
     end
-    API[] = a
-    a
 end
 
 fn(a::Api, name::Symbol) = unsafe_load(a.table, TABLE[name])
+fn(name::Symbol) = fn(api(), name)
 
-# --- Flags and enums (values from msquic.h) ---
-
-const CRED_FLAG_CLIENT = UInt32(0x1)
-const CRED_FLAG_NO_CERTIFICATE_VALIDATION = UInt32(0x4)
-const STREAM_OPEN_UNIDIRECTIONAL = UInt32(0x1)
-const SEND_FLAG_FIN = UInt32(0x4)
-const STREAM_SHUTDOWN_GRACEFUL = UInt32(0x1)
-const STREAM_SHUTDOWN_ABORT_SEND = UInt32(0x2)
-const STREAM_SHUTDOWN_ABORT_RECEIVE = UInt32(0x4)
-const RECEIVE_FLAG_FIN = UInt32(0x2)
-
-# QUIC_CONNECTION_EVENT_TYPE
-const CONN_CONNECTED = 0
-const CONN_SHUTDOWN_BY_TRANSPORT = 1
-const CONN_SHUTDOWN_BY_PEER = 2
-const CONN_SHUTDOWN_COMPLETE = 3
-const CONN_PEER_STREAM_STARTED = 6
-const CONN_DATAGRAM_STATE_CHANGED = 10
-const CONN_DATAGRAM_RECEIVED = 11
-const CONN_DATAGRAM_SEND_STATE_CHANGED = 12
-
-# QUIC_STREAM_EVENT_TYPE
-const STREAM_START_COMPLETE = 0
-const STREAM_RECEIVE = 1
-const STREAM_SEND_COMPLETE = 2
-const STREAM_PEER_SEND_SHUTDOWN = 3
-const STREAM_PEER_SEND_ABORTED = 4
-const STREAM_PEER_RECEIVE_ABORTED = 5
-const STREAM_SHUTDOWN_COMPLETE = 7
-
-# --- Settings (QUIC_SETTINGS, 144 bytes; IsSetFlags bits and field offsets measured) ---
-
-"""
-Build a QUIC_SETTINGS blob. Only the fields we need; everything else stays unset so msquic
-uses its defaults.
-"""
-function settings(; peer_bidi = 256, peer_unidi = 256, datagram_receive = true,
-                    idle_timeout_ms = 30_000, keep_alive_ms = 0)
-    s = zeros(UInt8, 144)
-    isset = UInt64(0)
-    isset |= UInt64(1) << 2                     # IdleTimeoutMs
-    isset |= UInt64(1) << 18                    # PeerBidiStreamCount
-    isset |= UInt64(1) << 19                    # PeerUnidiStreamCount
-    isset |= UInt64(1) << 27                    # DatagramReceiveEnabled
-    keep_alive_ms > 0 && (isset |= UInt64(1) << 16)   # KeepAliveIntervalMs
-    p = pointer(s)
-    GC.@preserve s begin
-        unsafe_store!(Ptr{UInt64}(p), isset)
-        unsafe_store!(Ptr{UInt64}(p + 24), UInt64(idle_timeout_ms))
-        unsafe_store!(Ptr{UInt32}(p + 88), UInt32(keep_alive_ms))
-        unsafe_store!(Ptr{UInt16}(p + 94), UInt16(peer_bidi))
-        unsafe_store!(Ptr{UInt16}(p + 96), UInt16(peer_unidi))
-        # bitfield byte at 106: SendBuffering:1 Pacing:1 Migration:1 DatagramReceive:1 ...
-        datagram_receive && unsafe_store!(Ptr{UInt8}(p + 106), UInt8(1) << 3)
-    end
-    s
-end
-
-"QUIC_CREDENTIAL_CONFIG (56 bytes). Type NONE; client; optionally skip certificate validation."
-function credential(; verify::Bool)
-    c = zeros(UInt8, 56)
-    flags = CRED_FLAG_CLIENT | (verify ? UInt32(0) : CRED_FLAG_NO_CERTIFICATE_VALIDATION)
-    GC.@preserve c unsafe_store!(Ptr{UInt32}(pointer(c) + 4), flags)
-    c
-end
-
-# --- Callbacks ---
-#
-# msquic calls these from its worker threads. Julia adopts a foreign thread on entry to a
-# @cfunction, so allocating and put!-ing into a Channel here is allowed. What is not allowed is
-# blocking for long, or touching the event's buffers after returning. So each callback copies
-# what it needs and hands it to the owner's Channel. The owner (Quic.Connection / Quic.Stream)
-# is the Context pointer; it is kept rooted in `LIVE` so the pointer stays valid.
-
-const LIVE = IdDict{Any,Nothing}()
-const LIVE_LOCK = ReentrantLock()
-root!(x) = (lock(LIVE_LOCK) do; LIVE[x] = nothing; end; x)
-unroot!(x) = lock(LIVE_LOCK) do; delete!(LIVE, x); end
-
-# Installed by Quic in __init__: (HQUIC, Ptr{Cvoid} ctx, Ptr{Cvoid} event) -> Status
-const CONNECTION_CB = Ref{Ptr{Cvoid}}(C_NULL)
-const STREAM_CB = Ref{Ptr{Cvoid}}(C_NULL)
-
-# --- Thin wrappers over the table ---
-
-function check(st::Status, what)
-    st == STATUS_SUCCESS || st == STATUS_PENDING || error("$what failed: 0x$(string(st, base=16))")
+function check(call::Symbol, st::Status)
+    st == STATUS_SUCCESS || st == STATUS_PENDING || throw(QuicError(call, st))
     st
 end
 
-function configuration_open(alpn::String, settings::Vector{UInt8})
+# --- Rooting ---
+#
+# msquic keeps our Context pointers and, for sends, our buffers. Anything it may still touch
+# is held here so the GC leaves it alone; it is released when msquic says it is done.
+
+const LIVE = IdDict{Any,Nothing}()
+const LIVE_LOCK = ReentrantLock()
+root!(x) = (lock(() -> (LIVE[x] = nothing), LIVE_LOCK); x)
+unroot!(x) = lock(() -> delete!(LIVE, x), LIVE_LOCK)
+unroot!(p::Ptr{Cvoid}) = p == C_NULL || unroot!(unsafe_pointer_to_objref(p))
+
+# Installed by Quic.__init__: (HQUIC, Ptr{Cvoid} ctx, Ptr{Cvoid} event) -> Status
+const CONNECTION_CB = Ref{Ptr{Cvoid}}(C_NULL)
+const STREAM_CB = Ref{Ptr{Cvoid}}(C_NULL)
+
+# --- Wrappers over the table ---
+
+function configuration_open(alpn::String, s::Settings)
     a = api()
-    buf = zeros(UInt8, 16)    # QUIC_BUFFER {uint32 Length; uint8* Buffer}
     out = Ref{HQUIC}(C_NULL)
-    GC.@preserve alpn buf settings begin
-        unsafe_store!(Ptr{UInt32}(pointer(buf)), UInt32(sizeof(alpn)))
-        unsafe_store!(Ptr{Ptr{UInt8}}(pointer(buf) + 8), pointer(alpn))
-        check(ccall(fn(a, :ConfigurationOpen), Status,
-                    (HQUIC, Ptr{UInt8}, UInt32, Ptr{UInt8}, UInt32, Ptr{Cvoid}, Ref{HQUIC}),
-                    a.registration, buf, 1, settings, length(settings), C_NULL, out), "ConfigurationOpen")
+    GC.@preserve alpn begin
+        buf = Ref(Buffer(sizeof(alpn), pointer(alpn)))
+        check(:ConfigurationOpen, ccall(fn(a, :ConfigurationOpen), Status,
+              (HQUIC, Ref{Buffer}, UInt32, Ref{Settings}, UInt32, Ptr{Cvoid}, Ref{HQUIC}),
+              a.registration, buf, 1, Ref(s), sizeof(Settings), C_NULL, out))
     end
     out[]
 end
 
-function configuration_load_credential(cfg::HQUIC, cred::Vector{UInt8})
-    GC.@preserve cred check(ccall(fn(api(), :ConfigurationLoadCredential), Status, (HQUIC, Ptr{UInt8}), cfg, cred),
-                            "ConfigurationLoadCredential")
+function configuration_load_credential(cfg::HQUIC; verify::Bool)
+    flags = CRED_FLAG_CLIENT | (verify ? 0x0 : CRED_FLAG_NO_CERTIFICATE_VALIDATION)
+    cred = Ref(CredentialConfig(0, flags, C_NULL, C_NULL, C_NULL, C_NULL, 0, C_NULL))
+    check(:ConfigurationLoadCredential, ccall(fn(:ConfigurationLoadCredential), Status, (HQUIC, Ref{CredentialConfig}), cfg, cred))
 end
-configuration_close(cfg::HQUIC) = ccall(fn(api(), :ConfigurationClose), Cvoid, (HQUIC,), cfg)
+configuration_close(cfg::HQUIC) = ccall(fn(:ConfigurationClose), Cvoid, (HQUIC,), cfg)
 
 function connection_open(ctx::Ptr{Cvoid})
     out = Ref{HQUIC}(C_NULL)
-    check(ccall(fn(api(), :ConnectionOpen), Status, (HQUIC, Ptr{Cvoid}, Ptr{Cvoid}, Ref{HQUIC}),
-                api().registration, CONNECTION_CB[], ctx, out), "ConnectionOpen")
+    check(:ConnectionOpen, ccall(fn(:ConnectionOpen), Status, (HQUIC, Ptr{Cvoid}, Ptr{Cvoid}, Ref{HQUIC}),
+                                 api().registration, CONNECTION_CB[], ctx, out))
     out[]
 end
-function connection_start(conn::HQUIC, cfg::HQUIC, host::String, port::Integer)
-    check(ccall(fn(api(), :ConnectionStart), Status, (HQUIC, HQUIC, UInt16, Cstring, UInt16),
-                conn, cfg, 0, host, port), "ConnectionStart")
-end
-connection_shutdown(conn::HQUIC, code::Integer = 0) =
-    ccall(fn(api(), :ConnectionShutdown), Cvoid, (HQUIC, UInt32, UInt64), conn, 0, code)
-connection_close(conn::HQUIC) = ccall(fn(api(), :ConnectionClose), Cvoid, (HQUIC,), conn)
+connection_start(conn::HQUIC, cfg::HQUIC, host::String, port::Integer) =
+    check(:ConnectionStart, ccall(fn(:ConnectionStart), Status, (HQUIC, HQUIC, UInt16, Cstring, UInt16), conn, cfg, 0, host, port))
+connection_shutdown(conn::HQUIC, code::Integer = 0) = ccall(fn(:ConnectionShutdown), Cvoid, (HQUIC, UInt32, UInt64), conn, 0, code)
+connection_close(conn::HQUIC) = ccall(fn(:ConnectionClose), Cvoid, (HQUIC,), conn)
 
 function stream_open(conn::HQUIC, flags::UInt32, ctx::Ptr{Cvoid})
     out = Ref{HQUIC}(C_NULL)
-    check(ccall(fn(api(), :StreamOpen), Status, (HQUIC, UInt32, Ptr{Cvoid}, Ptr{Cvoid}, Ref{HQUIC}),
-                conn, flags, STREAM_CB[], ctx, out), "StreamOpen")
+    check(:StreamOpen, ccall(fn(:StreamOpen), Status, (HQUIC, UInt32, Ptr{Cvoid}, Ptr{Cvoid}, Ref{HQUIC}), conn, flags, STREAM_CB[], ctx, out))
     out[]
 end
-stream_start(s::HQUIC) = check(ccall(fn(api(), :StreamStart), Status, (HQUIC, UInt32), s, 0), "StreamStart")
-set_callback_handler(h::HQUIC, cb::Ptr{Cvoid}, ctx::Ptr{Cvoid}) =
-    ccall(fn(api(), :SetCallbackHandler), Cvoid, (HQUIC, Ptr{Cvoid}, Ptr{Cvoid}), h, cb, ctx)
-stream_shutdown(s::HQUIC, flags::UInt32, code::Integer = 0) =
-    check(ccall(fn(api(), :StreamShutdown), Status, (HQUIC, UInt32, UInt64), s, flags, code), "StreamShutdown")
-stream_close(s::HQUIC) = ccall(fn(api(), :StreamClose), Cvoid, (HQUIC,), s)
+stream_start(s::HQUIC) = check(:StreamStart, ccall(fn(:StreamStart), Status, (HQUIC, UInt32), s, 0))
+set_callback_handler(h::HQUIC, cb::Ptr{Cvoid}, ctx::Ptr{Cvoid}) = ccall(fn(:SetCallbackHandler), Cvoid, (HQUIC, Ptr{Cvoid}, Ptr{Cvoid}), h, cb, ctx)
+stream_shutdown(s::HQUIC, flags::UInt32, code::Integer = 0) = check(:StreamShutdown, ccall(fn(:StreamShutdown), Status, (HQUIC, UInt32, UInt64), s, flags, code))
+stream_close(s::HQUIC) = ccall(fn(:StreamClose), Cvoid, (HQUIC,), s)
 
 """
-A send in flight. msquic reads the bytes asynchronously, so `data` and the QUIC_BUFFER that
-points at it must stay alive until SEND_COMPLETE, which hands `ctx` back so we can unroot.
+A send in flight. msquic reads `data` asynchronously, so it and the `Buffer` that points at it
+stay rooted until SEND_COMPLETE (or the datagram send state) hands the context back.
 """
 mutable struct Send
     data::Vector{UInt8}
-    qbuf::Vector{UInt8}
+    buffer::Ref{Buffer}
 end
-function make_send(data::Vector{UInt8})
-    qbuf = zeros(UInt8, 16)
-    s = Send(data, qbuf)
-    GC.@preserve data qbuf begin
-        unsafe_store!(Ptr{UInt32}(pointer(qbuf)), UInt32(length(data)))
-        unsafe_store!(Ptr{Ptr{UInt8}}(pointer(qbuf) + 8), pointer(data))
-    end
+function Send(data::Vector{UInt8})
+    s = Send(data, Ref(Buffer(length(data), pointer(data))))
     root!(s)
 end
 
 function stream_send(s::HQUIC, data::Vector{UInt8}; fin::Bool = false)
-    snd = make_send(data)
-    flags = fin ? SEND_FLAG_FIN : UInt32(0)
-    st = ccall(fn(api(), :StreamSend), Status, (HQUIC, Ptr{UInt8}, UInt32, UInt32, Ptr{Cvoid}),
-               s, snd.qbuf, 1, flags, pointer_from_objref(snd))
-    st == STATUS_SUCCESS || st == STATUS_PENDING || (unroot!(snd); error("StreamSend failed: 0x$(string(st, base=16))"))
+    snd = Send(data)
+    st = ccall(fn(:StreamSend), Status, (HQUIC, Ref{Buffer}, UInt32, UInt32, Ptr{Cvoid}),
+               s, snd.buffer, 1, fin ? SEND_FLAG_FIN : 0x0, pointer_from_objref(snd))
+    st == STATUS_SUCCESS || st == STATUS_PENDING || (unroot!(snd); throw(QuicError(:StreamSend, st)))
     nothing
 end
 
 function datagram_send(conn::HQUIC, data::Vector{UInt8})
-    snd = make_send(data)
-    st = ccall(fn(api(), :DatagramSend), Status, (HQUIC, Ptr{UInt8}, UInt32, UInt32, Ptr{Cvoid}),
-               conn, snd.qbuf, 1, 0, pointer_from_objref(snd))
-    st == STATUS_SUCCESS || st == STATUS_PENDING || (unroot!(snd); error("DatagramSend failed: 0x$(string(st, base=16))"))
+    snd = Send(data)
+    st = ccall(fn(:DatagramSend), Status, (HQUIC, Ref{Buffer}, UInt32, UInt32, Ptr{Cvoid}),
+               conn, snd.buffer, 1, 0, pointer_from_objref(snd))
+    st == STATUS_SUCCESS || st == STATUS_PENDING || (unroot!(snd); throw(QuicError(:DatagramSend, st)))
     nothing
 end
 
-# Read the bytes of a QUIC_BUFFER array (Buffers, count) into one Vector.
-function copy_buffers(buffers::Ptr{UInt8}, count::Integer)
+"Copy the bytes of `count` QUIC_BUFFERs into one Vector. Valid only during the callback."
+function copy_buffers(buffers::Ptr{Buffer}, count::Integer)
     out = UInt8[]
-    for i in 0:count-1
-        b = buffers + 16i
-        len = unsafe_load(Ptr{UInt32}(b))
-        ptr = unsafe_load(Ptr{Ptr{UInt8}}(b + 8))
-        len == 0 && continue
-        append!(out, unsafe_wrap(Vector{UInt8}, ptr, Int(len); own = false))
+    for i in 1:count
+        b = unsafe_load(buffers, i)
+        b.Length == 0 && continue
+        append!(out, unsafe_wrap(Vector{UInt8}, b.Buffer, Int(b.Length); own = false))
     end
     out
 end

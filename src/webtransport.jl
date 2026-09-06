@@ -1,53 +1,75 @@
 """
 A WebTransport session over HTTP/3. `connect(url)` does the H3 handshake, sends the Extended
-CONNECT, and returns a `Session` with Channels for incoming streams and datagrams.
+CONNECT, and returns a `Session`. Streams are `IO`s; datagrams and incoming streams are
+Channels.
 """
 module WebTransport
 
 using ..Quic, ..H3
-using ..Quic: readn
+using ..Quic: take_within
 
-export Session, connect, open_stream, send_datagram, datagrams, incoming_streams, close_write, reset
+export Session, connect, openstream, senddatagram, datagrams, streams, abort, ConnectError
 
 mutable struct Session
     conn::Quic.Connection
-    id::Int                             # the CONNECT stream's id = session id
-    request::Quic.Stream                # the CONNECT stream (carries capsules afterwards)
-    streams::Channel{Quic.Stream}       # streams the server opened for this session, header stripped
-    datagrams::Channel{Vector{UInt8}}
-    status::String
+    id::Int                              # the CONNECT stream's id is the session id
+    request::Quic.Stream                 # the CONNECT stream; carries capsules afterwards
+    streams::Channel{Quic.Stream}        # streams the server opened for this session, header stripped
+    datagrams::Channel{Vector{UInt8}}    # payloads only
+    url::String
     pump::Task
 end
+Base.show(io::IO, s::Session) = print(io, "WebTransport.Session(", s.url, ", id=", s.id, isopen(s) ? "" : ", closed", ")")
+
+struct ConnectError <: Exception
+    url::String
+    status::String
+end
+Base.showerror(io::IO, e::ConnectError) = print(io, "WebTransport CONNECT ", e.url, ": ", e.status)
 
 """
-    connect(url; verify = true, timeout = 5.0, kw...) -> Session
+    connect(url; verify = true, timeout = 5.0, settings...) -> Session
+    connect(f, url; ...)
 
-`url` is `https://host:port/path`. `verify = false` accepts a self-signed certificate.
-Throws if the server answers anything but 200.
+`url` is `https://host:port/path`. `verify = false` accepts a self-signed certificate. Throws
+`ConnectError` if the server answers anything but 200. The `do` form closes the session
+when `f` returns.
 """
 function connect(url::AbstractString; verify = true, timeout = 5.0, kw...)
     m = match(r"^https://([^/:]+)(?::(\d+))?(/.*)?$", url)
-    m === nothing && throw(ArgumentError("url must look like https://host:port/path"))
+    m === nothing && throw(ArgumentError("url must look like https://host:port/path, got $url"))
     host = m[1]; port = m[2] === nothing ? 443 : parse(Int, m[2]); path = something(m[3], "/")
     authority = m[2] === nothing ? host : "$host:$port"
 
     conn = Quic.connect(host, port; alpn = "h3", verify, timeout, kw...)
-    # Our three unidirectional streams: control (with SETTINGS), QPACK encoder, QPACK decoder.
-    ctrl = Quic.open_stream(conn; unidirectional = true)
-    write(ctrl, vcat(H3.encode_varint(H3.STREAM_CONTROL), H3.client_settings()))
-    write(Quic.open_stream(conn; unidirectional = true), H3.encode_varint(H3.STREAM_QPACK_ENCODER))
-    write(Quic.open_stream(conn; unidirectional = true), H3.encode_varint(H3.STREAM_QPACK_DECODER))
+    try
+        # Our three unidirectional streams: control (with SETTINGS), QPACK encoder, QPACK decoder.
+        write(Quic.openstream(conn; unidirectional = true), vcat(H3.encode_varint(H3.STREAM_CONTROL), H3.client_settings()))
+        write(Quic.openstream(conn; unidirectional = true), H3.encode_varint(H3.STREAM_QPACK_ENCODER))
+        write(Quic.openstream(conn; unidirectional = true), H3.encode_varint(H3.STREAM_QPACK_DECODER))
 
-    # Extended CONNECT on a bidi stream. Its id is the session id.
-    req = Quic.open_stream(conn)
-    write(req, H3.frame(H3.FRAME_HEADERS, H3.encode_connect(authority, path)))
-    status = read_status(req, timeout)
-    status == "200" || (close(conn); error("WebTransport CONNECT $path: $status"))
+        # Extended CONNECT on a bidi stream. Its id is the session id.
+        req = Quic.openstream(conn)
+        write(req, H3.frame(H3.FRAME_HEADERS, H3.encode_connect(authority, path)))
+        status = read_status(req, timeout)
+        status == "200" || throw(ConnectError(String(url), status))
 
-    sess = Session(conn, req.id, req, Channel{Quic.Stream}(Inf), Channel{Vector{UInt8}}(Inf), status,
-                   Task(() -> nothing))
-    sess.pump = Threads.@spawn pump(sess)
-    sess
+        sess = Session(conn, req.id, req, Channel{Quic.Stream}(Inf), Channel{Vector{UInt8}}(Inf), String(url), Task(() -> nothing))
+        sess.pump = Threads.@spawn pump(sess)
+        sess
+    catch
+        close(conn)
+        rethrow()
+    end
+end
+
+function connect(f, url::AbstractString; kw...)
+    s = connect(url; kw...)
+    try
+        f(s)
+    finally
+        close(s)
+    end
 end
 
 # Read frames on the request stream until a HEADERS frame yields a :status.
@@ -57,102 +79,70 @@ function read_status(req::Quic.Stream, timeout)
     while time() < deadline
         f = H3.parse_frame(buf)
         if f !== nothing
-            type, payload, rest = f
+            type, fpayload, rest = f
             buf = rest
-            if type == H3.FRAME_HEADERS
-                st = H3.decode_status(payload)
-                return st === nothing ? "?" : st
-            end
+            type == H3.FRAME_HEADERS && return something(H3.decode_status(fpayload), "?")
             continue
         end
-        ev = Quic.wait_for(req.inbox, deadline - time())
-        ev === nothing && break
-        ev[1] == :data && append!(buf, ev[2])
-        ev[1] == :reset && error("CONNECT stream reset: $(ev[2])")
-        ev[1] == :closed && break
+        chunk = readavailable(req)
+        isempty(chunk) && eof(req) && return "closed before a response"
+        append!(buf, chunk)
     end
-    "?"
+    "no response within $(timeout)s"
 end
 
-# Route connection events: peer streams get classified by their first bytes; datagrams get
-# their quarter-stream-id stripped. Server control/QPACK streams are drained and ignored.
+# Route what the connection delivers: peer streams get classified by their first bytes,
+# datagrams get their quarter-stream-id stripped. Anything for another session is dropped.
 function pump(sess::Session)
-    for ev in sess.conn.events
-        try
-            if ev[1] == :stream
-                Threads.@spawn classify(sess, ev[2])
-            elseif ev[1] == :datagram
-                d = H3.parse_datagram(ev[2])
-                d !== nothing && d[1] == sess.id && put!(sess.datagrams, d[2])
-            elseif ev[1] == :shutdown
-                break
-            end
-        catch e
-            @error "hayate pump" exception = (e, catch_backtrace())
+    @sync begin
+        Threads.@spawn for s in Quic.streams(sess.conn)
+            Threads.@spawn try classify(sess, s) catch e; @error "hayate classify" exception = (e, catch_backtrace()) end
+        end
+        Threads.@spawn for d in Quic.datagrams(sess.conn)
+            p = H3.parse_datagram(d)
+            p !== nothing && p[1] == sess.id && put!(sess.datagrams, p[2])
         end
     end
     close(sess.streams); close(sess.datagrams)
 end
 
+# Read enough of a peer stream to know what it is. WebTransport streams for this session go
+# to `streams`; the server's control and QPACK streams are drained and forgotten.
 function classify(sess::Session, s::Quic.Stream)
-    buf = UInt8[]
-    while true
-        bytes, fin = read(s)
-        append!(buf, bytes)
-        r = H3.decode_varint(buf)
-        if r !== nothing
-            type, i = r
-            if type == H3.STREAM_WT_UNI || type == H3.FRAME_WT_BIDI
-                r2 = H3.decode_varint(buf, i)
-                if r2 !== nothing
-                    sid, j = r2
-                    if sid == sess.id
-                        rest = buf[j:end]
-                        isempty(rest) || pushfirst_data!(s, rest, fin)
-                        put!(sess.streams, s)
-                    else
-                        close(s)
-                    end
-                    return
-                end
-            else
-                drain(s); return                              # control / qpack / unknown: read and forget
-            end
+    head = UInt8[]
+    while !eof(s)
+        push!(head, read(s, UInt8))
+        r = H3.decode_varint(head)
+        r === nothing && continue
+        type, i = r
+        if type == H3.STREAM_WT_UNI || type == H3.FRAME_WT_BIDI
+            r2 = H3.decode_varint(head, i)
+            r2 === nothing && continue
+            r2[1] == sess.id ? put!(sess.streams, s) : abort(s)
+            return
+        else
+            while !eof(s); readavailable(s); end
+            return
         end
-        fin && return
     end
 end
 
-# Put bytes we already pulled off a stream back at the front of its inbox.
-function pushfirst_data!(s::Quic.Stream, bytes, fin)
-    rest = Any[]
-    while isready(s.inbox); push!(rest, take!(s.inbox)); end
-    put!(s.inbox, (:data, bytes, fin))
-    for x in rest; put!(s.inbox, x); end
-end
-
-function drain(s::Quic.Stream)
-    while true
-        _, fin = read(s)
-        fin && return
-    end
-end
-
-"Open a WebTransport stream for this session. The header is written for you."
-function open_stream(sess::Session; unidirectional::Bool = false)
-    s = Quic.open_stream(sess.conn; unidirectional)
+"Open a WebTransport stream on this session. The header is written for you."
+function openstream(sess::Session; unidirectional::Bool = false)
+    s = Quic.openstream(sess.conn; unidirectional)
     write(s, H3.wt_stream_header(sess.id, !unidirectional))
     s
 end
 
-send_datagram(sess::Session, data::AbstractVector{UInt8}) = Quic.send_datagram(sess.conn, H3.datagram(sess.id, data))
-send_datagram(sess::Session, s::AbstractString) = send_datagram(sess, Vector{UInt8}(codeunits(s)))
+senddatagram(sess::Session, data::AbstractVector{UInt8}) = Quic.senddatagram(sess.conn, H3.datagram(sess.id, data))
+senddatagram(sess::Session, str::AbstractString) = senddatagram(sess, codeunits(str))
 
-"Channel of datagrams from the server (payload only)."
+"Datagrams from the server for this session, as a Channel of payloads."
 datagrams(sess::Session) = sess.datagrams
-"Channel of streams the server opened for this session, header already stripped."
-incoming_streams(sess::Session) = sess.streams
+"Streams the server opened for this session, as a Channel. Headers already stripped."
+streams(sess::Session) = sess.streams
 
+Base.isopen(sess::Session) = isopen(sess.conn)
 Base.close(sess::Session) = close(sess.conn)
 
 end # module WebTransport

@@ -1,6 +1,29 @@
 using Test
 using Hayate
-using Hayate: H3, Quic, WebTransport
+using Hayate: MsQuic, H3, Quic, WebTransport
+
+@testset "msquic: struct layouts match clang (test/off.c)" begin
+    @test sizeof(MsQuic.Buffer) == 16
+    @test sizeof(MsQuic.RegistrationConfig) == 16
+    @test sizeof(MsQuic.CredentialConfig) == 56
+    @test fieldoffset(MsQuic.CredentialConfig, 7) == 40      # AllowedCipherSuites
+    @test fieldoffset(MsQuic.CredentialConfig, 8) == 48      # CaCertificateFile
+    @test sizeof(MsQuic.Settings) == 144
+    off(T, name) = fieldoffset(T, findfirst(==(name), fieldnames(T)))
+    @test off(MsQuic.Settings, :IdleTimeoutMs) == 24
+    @test off(MsQuic.Settings, :KeepAliveIntervalMs) == 88
+    @test off(MsQuic.Settings, :PeerBidiStreamCount) == 94
+    @test off(MsQuic.Settings, :PeerUnidiStreamCount) == 96
+    @test off(MsQuic.Settings, :Bits) == 106
+    @test off(MsQuic.Settings, :MaxOperationsPerDrain) == 107
+    # event payloads sit at +8; these are offsets within the payload
+    @test off(MsQuic.EvShutdownByTransport, :ErrorCode) == 8   # 16 - 8
+    @test off(MsQuic.EvPeerStreamStarted, :Flags) == 8         # 16 - 8
+    @test off(MsQuic.EvDatagramStateChanged, :MaxSendLength) == 2
+    @test off(MsQuic.EvStartComplete, :ID) == 8
+    @test off(MsQuic.EvReceive, :Buffers) == 16 && off(MsQuic.EvReceive, :BufferCount) == 24 && off(MsQuic.EvReceive, :Flags) == 28
+    @test off(MsQuic.EvSendComplete, :ClientContext) == 8
+end
 
 @testset "h3: varint" begin
     for v in (0, 63, 64, 16383, 16384, 1073741823, 1073741824, 4611686018427387903)
@@ -23,7 +46,7 @@ end
 
 @testset "h3: qpack static-only" begin
     blk = H3.encode_connect("localhost", "/asobi?name=x")
-    @test blk[1:4] == UInt8[0x00, 0x00, 0xcf, 0xd7]          # prefix, :method CONNECT, :scheme https
+    @test blk[1:4] == UInt8[0x00, 0x00, 0xcf, 0xd7]            # prefix, :method CONNECT, :scheme https
     @test H3.decode_status(UInt8[0x00, 0x00, 0xd9]) == "200"   # what cowlib sends for 200
     @test H3.decode_status(UInt8[0x00, 0x00, 0xff, 0x05]) == "403"
     # Huffman digits (RFC 7541 codes): '4' = 011010, '0' = 00000, '1' = 00001, then 1-padding
@@ -44,7 +67,7 @@ function with_server(f)
     """
     p = run(pipeline(Cmd(`mix run --no-halt -e $boot`; dir = CORE); stdout = devnull, stderr = devnull); wait = false)
     try
-        sleep(4)                                              # mix boot + listener
+        sleep(4)
         f()
     finally
         kill(p); wait(p)
@@ -52,30 +75,34 @@ function with_server(f)
 end
 
 with_server() do
-    @testset "webtransport: CONNECT, bidi echo, datagram echo" begin
-        s = WebTransport.connect("https://localhost:$PORT/"; verify = false)
-        @test s.status == "200"
-        @test s.id >= 0
+    @testset "webtransport: streams are IO, datagrams are a Channel" begin
+        WebTransport.connect("https://localhost:$PORT/"; verify = false) do s
+            @test s.id >= 0
+            @test isopen(s)
 
-        st = WebTransport.open_stream(s)
-        write(st, "hello, hayate"; fin = true)
-        @test String(read(st, Vector{UInt8})) == "hello, hayate"
+            st = WebTransport.openstream(s)
+            print(st, "hello, "); write(st, "hayate"); closewrite(st)
+            @test read(st, String) == "hello, hayate"
+            @test eof(st)
 
-        WebTransport.send_datagram(s, "ping")
-        d = Quic.wait_for(WebTransport.datagrams(s), 3.0)
-        @test d !== nothing && String(d) == "ping"
+            st2 = WebTransport.openstream(s)
+            write(st2, "line one\nline two\n"); closewrite(st2)
+            @test readline(st2) == "line one"
+            @test readline(st2) == "line two"
 
-        big = rand(UInt8, 200_000)
-        st2 = WebTransport.open_stream(s)
-        write(st2, big; fin = true)
-        @test read(st2, Vector{UInt8}) == big
+            WebTransport.senddatagram(s, "ping")
+            d = Quic.take_within(WebTransport.datagrams(s), 3.0)
+            @test d !== nothing && String(d) == "ping"
 
-        close(s)
+            big = rand(UInt8, 200_000)
+            st3 = WebTransport.openstream(s)
+            write(st3, big); closewrite(st3)
+            @test read(st3) == big
+        end
     end
 
-    @testset "webtransport: rejected CONNECT surfaces the status" begin
-        # the echo server only knows CONNECT; a non-WT path is still 200 there, so test the shape
-        # of an error through a closed port instead
-        @test_throws Exception WebTransport.connect("https://localhost:1/"; verify = false, timeout = 1.0)
+    @testset "errors are exceptions with a story" begin
+        @test_throws Quic.ConnectError WebTransport.connect("https://localhost:1/"; verify = false, timeout = 1.0)
+        @test_throws ArgumentError WebTransport.connect("http://nope")
     end
 end
