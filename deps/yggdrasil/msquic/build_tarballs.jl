@@ -14,23 +14,24 @@ version = v"2.5.7"
 sources = [
     GitSource("https://github.com/microsoft/msquic.git", "801b0e958f3e33e9998766c3371c1ca348254650"),
     GitSource("https://github.com/quictls/openssl.git", "ff36838bb69801cad56823159a036977bcbe5c75"),
-    # msquic's macOS certificate code calls SecTrustEvaluateWithError (macOS 10.14). The
-    # default x86_64 SDK is older, so bring the 10.14 one, the way other Yggdrasil recipes do.
-    ArchiveSource("https://github.com/phracker/MacOSX-SDKs/releases/download/10.15/MacOSX10.14.sdk.tar.xz",
-                  "0f03869f72df8705b832910517b47dd5b79eb4e160512602f593ed243b28715f"),
+    # msquic's posix platform uses timespec_get (macOS 10.15) and its certificate code
+    # SecTrustEvaluateWithError (10.14). The default x86_64 SDK is older, so bring the 10.15
+    # one, the way other Yggdrasil recipes do.
+    ArchiveSource("https://github.com/phracker/MacOSX-SDKs/releases/download/10.15/MacOSX10.15.sdk.tar.xz",
+                  "2408d07df7f324d3beea818585a6d990ba99587c218a3969f924dfcc4de93b62"),
 ]
 
 script = raw"""
 cd ${WORKSPACE}/srcdir
 
 if [[ "${target}" == x86_64-apple-darwin* ]]; then
-    # A newer macOS SDK, for SecTrustEvaluateWithError.
-    pushd ${WORKSPACE}/srcdir/MacOSX10.14.sdk
+    # A newer macOS SDK, for timespec_get and SecTrustEvaluateWithError.
+    pushd ${WORKSPACE}/srcdir/MacOSX10.15.sdk
     rm -rf /opt/${target}/${target}/sys-root/System
     cp -ra usr/* "/opt/${target}/${target}/sys-root/usr/."
     cp -ra System "/opt/${target}/${target}/sys-root/."
     popd
-    export MACOSX_DEPLOYMENT_TARGET=10.14
+    export MACOSX_DEPLOYMENT_TARGET=10.15
 fi
 if [[ "${target}" == *-apple-* ]]; then
     # msquic builds with -Werror; this clang flags a VLA-folded-to-constant in datapath_kqueue.c
