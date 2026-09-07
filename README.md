@@ -9,7 +9,6 @@ need a browser to do it.
 
 > **Status: it works, and it is young.** It talks to karutte-core end to end (CONNECT 200,
 > bidirectional echo, datagram echo, 200 KB round trips) on real QUIC; 48 tests. The API may still move.
-> There is no `msquic_jll` yet, so it borrows the `libmsquic.dylib` that quicer builds.
 
 ## What it looks like
 
@@ -58,9 +57,12 @@ happens on msquic's threads. Julia adopts the foreign thread on entry, so this i
 
 - Julia 1.10 or newer. Run with `-t 2` or more; the session pump is a task.
 - `libmsquic`. Three ways, in order of preference:
-  1. `using msquic_jll` alongside Hayate. The jll is not in the General registry yet; the
-     Yggdrasil recipe is in [`deps/yggdrasil/msquic/`](deps/yggdrasil/msquic/), and a
-     hand-built stand-in with the same shape lives at `~/repos/msquic_jll` for now.
+  1. [`msquic_jll`](https://github.com/f3liz-casa/msquic_jll.jl) alongside Hayate:
+     ```julia
+     Pkg.add(url = "https://github.com/f3liz-casa/msquic_jll.jl"); using Hayate, msquic_jll
+     ```
+     Built with BinaryBuilder for every Linux and macOS platform it knows. Not in the General
+     registry yet; the recipe lives in that repo, in Yggdrasil's shape.
   2. `HAYATE_LIBMSQUIC=/path/to/libmsquic.dylib`.
   3. Nothing: Hayate looks for the one quicer built inside a karutte checkout.
 
